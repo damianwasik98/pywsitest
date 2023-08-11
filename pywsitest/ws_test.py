@@ -1,10 +1,13 @@
 import asyncio
 import json
 import ssl
+from types import TracebackType
+from typing import Type
 
 from requests.exceptions import ConnectTimeout, ReadTimeout
 import websockets
 from websockets.client import WebSocketClientProtocol
+from websockets.protocol import State
 
 from .ws_message import WSMessage
 from .ws_response import WSResponse
@@ -97,6 +100,8 @@ class WSTest:  # noqa: pylint - too-many-instance-attributes
         self.request_timeout = 10.0
         self.test_timeout = 60.0
         self.log_responses_on_error = False
+
+        self._websocket: WebSocketClientProtocol | None = None
 
     def with_parameter(self, key: str, value: object) -> "WSTest":
         """
@@ -230,16 +235,40 @@ class WSTest:  # noqa: pylint - too-many-instance-attributes
         return self
 
     # pylint:disable=no-member
-    async def run(self):
+    async def run(
+        self, 
+        receive_messages: bool = True,
+        send_messages: bool = True,
+        send_requests: bool = True,
+    ):
         """
         Runs the integration tests
-        Sends any messages to the websocket
+        Sends any messages to the websocket (you can turn it off and send them manually)
         Receives any responses from the websocket
+
+        Parameters:
+            receive_messages (bool): will wait for given messages if true
+            send_messages (bool): will send all given messages if true
+            send_requests (bool): will send all given requests if true
 
         Raises:
             WSTimeoutError: If the test/sending/receiving fails to finish within the time limit
         """
-        kwargs = {}
+        runner = self._runner(
+            self._websocket,
+            receive_messages=receive_messages,
+            send_messages=send_messages,
+            send_requests=send_requests,
+        )
+
+        try:
+            # Run the receive and send methods async with a timeout
+            await asyncio.wait_for(runner, timeout=self.test_timeout)
+        except asyncio.TimeoutError as ex:
+            raise WSTimeoutError("Timed out waiting for test to finish") from ex
+
+    async def connect(self):
+        kwargs = {"ping_interval": None}
         connection_string = self._get_connection_string()
 
         # add ssl if using wss
@@ -251,17 +280,48 @@ class WSTest:  # noqa: pylint - too-many-instance-attributes
             kwargs["extra_headers"] = self.headers
 
         websocket = await websockets.connect(connection_string, **kwargs)
+        self._websocket = websocket
+    
+    async def disconnect(self):
+        await self._websocket.close()
 
-        try:
-            # Run the receive and send methods async with a timeout
-            await asyncio.wait_for(self._runner(websocket), timeout=self.test_timeout)
-        except asyncio.TimeoutError as ex:
-            raise WSTimeoutError("Timed out waiting for test to finish") from ex
-        finally:
-            await websocket.close()
+    def is_connected(self) -> bool:
+        """Returns state of websocket connection
 
-    async def _runner(self, websocket: WebSocketClientProtocol):
-        await asyncio.gather(self._receive(websocket), self._send(websocket), self._request())
+        Returns:
+            bool: true if websocket connection is established
+        """
+        return self._websocket.state == State.OPEN if self._websocket else False
+
+    def is_complete(self) -> bool:
+        """
+        Checks whether the test has finished running
+
+        Returns:
+            (bool): Value to indicate whether the test has finished
+        """
+        return not self.expected_responses and not self.messages and not self.requests
+
+    async def _runner(
+            self,
+            websocket: WebSocketClientProtocol,
+            receive_messages: bool,
+            send_messages: bool,
+            send_requests: bool,
+        ):
+        coros = []
+        if receive_messages:
+            coros.append(self._receive(websocket))
+        if send_messages:
+            coros.append(self._send(websocket))
+        if send_requests:
+            coros.append(self._request())
+
+        if not coros:
+            #TODO: raise proper exception
+            raise Exception("At least one arg must be True ('receive_messages', 'send_messages', 'send_requests')")
+
+        await asyncio.gather(*coros)
 
     async def _receive(self, websocket: WebSocketClientProtocol):
         # iterate while there are still expected responses that haven't been received yet
@@ -343,11 +403,14 @@ class WSTest:  # noqa: pylint - too-many-instance-attributes
 
         return error_message
 
-    def is_complete(self) -> bool:
-        """
-        Checks whether the test has finished running
+    async def __aenter__(self) -> "WSTest":
+        await self.connect()
+        return self
 
-        Returns:
-            (bool): Value to indicate whether the test has finished
-        """
-        return not self.expected_responses and not self.messages and not self.requests
+    async def __aexit__(
+        self,
+        exc_type: Type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.disconnect()
